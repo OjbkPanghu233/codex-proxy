@@ -1,0 +1,830 @@
+// Derived from antigravity-proxy (BSD-2-Clause); see LICENSE.txt / AUTHORS.txt.
+#pragma once
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include <array>
+#include <charconv>
+#include <system_error>
+#include <sstream>
+#include <cstdint>
+#include <string_view>
+#include <utility>
+#include "Logger.hpp"
+#include "UdpPolicy.hpp"
+
+namespace Core {
+    struct ProxyConfig {
+        std::string host = "127.0.0.1";
+        int port = 7890;
+        std::string type = "socks5";
+        std::string username;
+        std::string password;
+        bool ignore_system_proxy = true;
+    };
+
+    struct FakeIPConfig {
+        bool enabled = true;
+        std::string cidr = "198.18.0.0/15";
+        // 注：max_entries 已废弃，Ring Buffer 策略下自动循环复用地址池
+    };
+
+    struct TimeoutConfig {
+        int connect_ms = 5000;
+        int send_ms = 5000;
+        int recv_ms = 5000;
+    };
+
+    // ============= 路由规则配置（支持 IP/CIDR/域名通配符/端口/协议） =============
+    struct RoutingRule {
+        std::string name;
+        bool enabled = true;
+        std::string action = "proxy"; // direct/proxy
+        int priority = 0;             // priority_mode=number 时使用
+        std::vector<std::string> ip_cidrs_v4;
+        std::vector<std::string> ip_cidrs_v6;
+        std::vector<std::string> domains;   // 支持通配符与后缀
+        std::vector<std::string> ports;     // 80 / 443 / 10000-20000
+        std::vector<std::string> protocols; // tcp
+    };
+
+    struct RoutingConfig {
+        bool enabled = true;
+        std::string priority_mode = "order"; // order/number
+        std::string default_action = "proxy";
+        bool use_default_private = true;
+        std::vector<RoutingRule> rules;
+    };
+
+    // ============= 代理路由规则 =============
+    // 用于控制哪些端口走代理、DNS 53 端口的特殊处理策略
+    struct ProxyRules {
+        // 允许代理的目标端口白名单（为空则代理所有端口）
+        // 默认: 仅代理 HTTP(80) 和 HTTPS(443)
+        std::vector<uint16_t> allowed_ports = {80, 443};
+        
+        // DNS (Port 53) 处理策略
+        // "direct" - 直连, 不经代理 (默认, 解决 DNS 超时问题)
+        // "proxy"  - 走代理
+        std::string dns_mode = "direct";
+        
+        // IPv6 处理策略
+        // "proxy"  - IPv6 走代理 (默认，兼容 IPv4/IPv6)
+        // "direct" - IPv6 直连
+        // "block"  - 阻止 IPv6 连接
+        std::string ipv6_mode = "proxy";
+
+        // UDP 处理策略
+        // "auto"   - SOCKS5 自动走 UDP Associate；其它代理按 udp_fallback 处理（默认）
+        // "block"  - 阻断 UDP，强制应用尝试回退 TCP
+        // "direct" - UDP 直连（保持现状）
+        // "proxy"  - UDP 走代理（需要代理端支持 SOCKS5 UDP Associate；用于 QUIC/HTTP3 等必须 UDP 的协议）
+        std::string udp_mode = "auto";
+
+        // UDP 代理失败或 auto 遇到非 SOCKS5 代理时的降级策略
+        // "block"  - 失败即阻断（默认，避免 UDP 直连泄漏）
+        // "direct" - 失败回退直连（风险更高，但可用于“代理不支持 UDP”时的兼容模式）
+        std::string udp_fallback = "block";
+
+        // 路由规则（内网/域名/端口/协议分流）
+        RoutingConfig routing;
+
+        struct CidrRuleV4 {
+            uint32_t network;  // host order
+            uint32_t mask;     // host order
+        };
+
+        struct CidrRuleV6 {
+            std::array<uint8_t, 16> network{};
+            int prefix = 0;
+        };
+
+        struct PortRange {
+            uint16_t start = 0;
+            uint16_t end = 0;
+        };
+
+        struct CompiledRoutingRule {
+            RoutingRule raw;
+            std::vector<CidrRuleV4> v4;
+            std::vector<CidrRuleV6> v6;
+            std::vector<std::string> domains; // lowercased
+            std::vector<PortRange> port_ranges;
+            std::vector<std::string> protocols; // lowercased
+        };
+
+        std::vector<CompiledRoutingRule> compiled_rules;
+        std::vector<size_t> compiled_order;
+
+        // 编译统计（用于启动日志摘要，便于快速判断规则是否生效）
+        size_t compiled_valid_cidr_v4 = 0;
+        size_t compiled_valid_cidr_v6 = 0;
+        size_t compiled_valid_port_ranges = 0;
+        size_t compiled_skipped_invalid_items = 0;
+        size_t compiled_skipped_invalid_cidr_v4 = 0;
+        size_t compiled_skipped_invalid_cidr_v6 = 0;
+        size_t compiled_skipped_invalid_ports = 0;
+
+        // 快速判断端口是否在白名单中
+        bool IsPortAllowed(uint16_t port) const {
+            if (allowed_ports.empty()) return true; // 空白名单 = 允许所有
+            // 约定：Load() 后会对 allowed_ports 排序去重，这里用 binary_search 提升热路径性能
+            return std::binary_search(allowed_ports.begin(), allowed_ports.end(), port);
+        }
+
+        static std::string ToLower(std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            return s;
+        }
+
+        static bool EndsWith(const std::string& s, const std::string& suffix) {
+            if (s.size() < suffix.size()) return false;
+            return s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        }
+
+        // 去除首尾空白（仅用于配置解析；运行时热路径尽量避免额外分配）
+        static std::string_view TrimView(std::string_view s) {
+            while (!s.empty() && std::isspace((unsigned char)s.front())) s.remove_prefix(1);
+            while (!s.empty() && std::isspace((unsigned char)s.back())) s.remove_suffix(1);
+            return s;
+        }
+
+        // 安全整数解析：不抛异常，失败返回 false
+        static bool TryParseUInt32(std::string_view s, uint32_t* out, int base = 10) {
+            if (!out) return false;
+            s = TrimView(s);
+            if (s.empty()) return false;
+            uint32_t v = 0;
+            const char* begin = s.data();
+            const char* end = s.data() + s.size();
+            auto rc = std::from_chars(begin, end, v, base);
+            if (rc.ec != std::errc() || rc.ptr != end) return false;
+            *out = v;
+            return true;
+        }
+
+        static bool ParseIPv4View(std::string_view ip, uint32_t* outHostOrder) {
+            if (!outHostOrder) return false;
+            ip = TrimView(ip);
+            uint32_t parts[4] = {0, 0, 0, 0};
+            size_t start = 0;
+            for (int i = 0; i < 4; i++) {
+                size_t end = ip.find('.', start);
+                if ((end == std::string_view::npos) != (i == 3)) return false;
+                std::string_view token = (end == std::string_view::npos) ? ip.substr(start)
+                                                                         : ip.substr(start, end - start);
+                token = TrimView(token);
+                if (token.empty() || token.size() > 3) return false;
+                uint32_t value = 0;
+                if (!TryParseUInt32(token, &value, 10)) return false;
+                if (value > 255) return false;
+                parts[i] = value;
+                if (end == std::string_view::npos) break;
+                start = end + 1;
+            }
+            *outHostOrder = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+            return true;
+        }
+
+        static bool ParseIPv4(const std::string& ip, uint32_t* outHostOrder) {
+            return ParseIPv4View(ip, outHostOrder);
+        }
+
+        static bool ParseIPv6(const std::string& ip, std::array<uint8_t, 16>* out) {
+            if (!out) return false;
+            std::string_view s = TrimView(ip);
+            if (s.empty()) return false;
+
+            auto parseHexWord = [&](std::string_view part, uint16_t* outWord) -> bool {
+                if (!outWord) return false;
+                part = TrimView(part);
+                if (part.empty() || part.size() > 4) return false;
+                uint32_t tmp = 0;
+                if (!TryParseUInt32(part, &tmp, 16)) return false;
+                if (tmp > 0xFFFF) return false;
+                *outWord = (uint16_t)tmp;
+                return true;
+            };
+
+            auto parseSide = [&](std::string_view side, std::array<uint16_t, 8>* outWords, int* outCount) -> bool {
+                if (!outWords || !outCount) return false;
+                *outCount = 0;
+                if (side.empty()) return true;
+                size_t start = 0;
+                while (start <= side.size()) {
+                    size_t end = side.find(':', start);
+                    std::string_view token = (end == std::string_view::npos) ? side.substr(start)
+                                                                             : side.substr(start, end - start);
+                    if (token.empty()) return false; // 不允许出现单独的 ':'（:: 压缩已在外层处理）
+                    if (token.find('.') != std::string_view::npos) {
+                        // IPv4-embedded IPv6：仅允许出现在最后一个 token
+                        if (end != std::string_view::npos) return false;
+                        uint32_t ip4 = 0;
+                        if (!ParseIPv4View(token, &ip4)) return false;
+                        if (*outCount + 2 > 8) return false;
+                        (*outWords)[(*outCount)++] = (uint16_t)((ip4 >> 16) & 0xFFFF);
+                        (*outWords)[(*outCount)++] = (uint16_t)(ip4 & 0xFFFF);
+                        return true;
+                    }
+                    uint16_t w = 0;
+                    if (!parseHexWord(token, &w)) return false;
+                    if (*outCount >= 8) return false;
+                    (*outWords)[(*outCount)++] = w;
+                    if (end == std::string_view::npos) break;
+                    start = end + 1;
+                }
+                return true;
+            };
+
+            std::array<uint16_t, 8> words{};
+            const size_t dc = s.find("::");
+            if (dc != std::string_view::npos) {
+                // 仅允许出现一次 ::
+                if (s.substr(0, dc).find('.') != std::string_view::npos) return false;
+                if (s.find("::", dc + 2) != std::string_view::npos) return false;
+                std::array<uint16_t, 8> left{};
+                std::array<uint16_t, 8> right{};
+                int leftCount = 0;
+                int rightCount = 0;
+                if (!parseSide(s.substr(0, dc), &left, &leftCount)) return false;
+                if (!parseSide(s.substr(dc + 2), &right, &rightCount)) return false;
+                if (leftCount + rightCount > 8) return false;
+                const int fill = 8 - (leftCount + rightCount);
+                if (fill <= 0) return false; // :: 必须至少压缩 1 个 16-bit 段
+                int idx = 0;
+                for (int i = 0; i < leftCount; i++) words[idx++] = left[i];
+                for (int i = 0; i < fill; i++) words[idx++] = 0;
+                for (int i = 0; i < rightCount; i++) words[idx++] = right[i];
+                if (idx != 8) return false;
+            } else {
+                int count = 0;
+                if (!parseSide(s, &words, &count)) return false;
+                if (count != 8) return false;
+            }
+
+            for (int k = 0; k < 8; k++) {
+                (*out)[k * 2] = static_cast<uint8_t>(words[k] >> 8);
+                (*out)[k * 2 + 1] = static_cast<uint8_t>(words[k] & 0xff);
+            }
+            return true;
+        }
+
+        static bool ParseCidrV4(const std::string& cidr, CidrRuleV4* out) {
+            if (!out) return false;
+            size_t slashPos = cidr.find('/');
+            if (slashPos == std::string::npos) return false;
+            std::string_view ipPart = TrimView(std::string_view(cidr).substr(0, slashPos));
+            std::string_view bitsPart = TrimView(std::string_view(cidr).substr(slashPos + 1));
+            if (bitsPart.empty()) return false;
+            uint32_t bitsU = 0;
+            if (!TryParseUInt32(bitsPart, &bitsU, 10) || bitsU > 32) return false;
+            const int bits = (int)bitsU;
+            uint32_t ip = 0;
+            if (!ParseIPv4View(ipPart, &ip)) return false;
+            uint32_t mask = (bits == 0) ? 0 : (0xFFFFFFFFu << (32 - bits));
+            out->mask = mask;
+            out->network = ip & mask;
+            return true;
+        }
+
+        static bool ParseCidrV6(const std::string& cidr, CidrRuleV6* out) {
+            if (!out) return false;
+            size_t slashPos = cidr.find('/');
+            if (slashPos == std::string::npos) return false;
+            std::string_view ipPart = TrimView(std::string_view(cidr).substr(0, slashPos));
+            std::string_view bitsPart = TrimView(std::string_view(cidr).substr(slashPos + 1));
+            if (bitsPart.empty()) return false;
+            uint32_t bitsU = 0;
+            if (!TryParseUInt32(bitsPart, &bitsU, 10) || bitsU > 128) return false;
+            const int bits = (int)bitsU;
+            std::array<uint8_t, 16> addr{};
+            if (!ParseIPv6(std::string(ipPart), &addr)) return false;
+            out->network = addr;
+            out->prefix = bits;
+            if (bits == 0) {
+                for (int i = 0; i < 16; i++) out->network[i] = 0;
+            } else if (bits < 128) {
+                int fullBytes = bits / 8;
+                int rem = bits % 8;
+                if (fullBytes < 16) {
+                    uint8_t mask = (rem == 0) ? 0 : (uint8_t)(0xFF << (8 - rem));
+                    out->network[fullBytes] &= mask;
+                    for (int i = fullBytes + 1; i < 16; i++) out->network[i] = 0;
+                }
+            }
+            return true;
+        }
+
+        static bool MatchCidrV4(uint32_t ipHostOrder, const CidrRuleV4& rule) {
+            return (ipHostOrder & rule.mask) == rule.network;
+        }
+
+        static bool MatchCidrV6(const std::array<uint8_t, 16>& ip, const CidrRuleV6& rule) {
+            int bits = rule.prefix;
+            int fullBytes = bits / 8;
+            int rem = bits % 8;
+            for (int i = 0; i < fullBytes; i++) {
+                if (ip[i] != rule.network[i]) return false;
+            }
+            if (rem == 0) return true;
+            uint8_t mask = (uint8_t)(0xFF << (8 - rem));
+            return (ip[fullBytes] & mask) == (rule.network[fullBytes] & mask);
+        }
+
+        static bool GlobMatch(const std::string& pattern, const std::string& text) {
+            size_t p = 0, t = 0, star = std::string::npos, match = 0;
+            while (t < text.size()) {
+                if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t])) {
+                    p++;
+                    t++;
+                } else if (p < pattern.size() && pattern[p] == '*') {
+                    star = p++;
+                    match = t;
+                } else if (star != std::string::npos) {
+                    p = star + 1;
+                    t = ++match;
+                } else {
+                    return false;
+                }
+            }
+            while (p < pattern.size() && pattern[p] == '*') p++;
+            return p == pattern.size();
+        }
+
+        static bool MatchDomainPattern(const std::string& pattern, const std::string& host) {
+            if (pattern.empty() || host.empty()) return false;
+            // 性能优化：pattern/host 在上层已统一转为小写并去掉末尾 '.'，此处避免重复 ToLower 与分配。
+            const std::string& p = pattern;
+            const std::string& h = host;
+
+            const bool hasWildcard = (p.find('*') != std::string::npos) || (p.find('?') != std::string::npos);
+            if (!hasWildcard && !p.empty() && p[0] == '.') {
+                // 规则 ".example.com" 需同时匹配 "example.com" 与 "*.example.com"
+                const size_t rootLen = p.size() - 1;
+                if (h.size() == rootLen && h.compare(0, rootLen, p, 1, rootLen) == 0) return true;
+                return EndsWith(h, p);
+            }
+            if (!hasWildcard) return h == p;
+            return GlobMatch(p, h);
+        }
+
+        static bool ParsePortRange(const std::string& token, PortRange* out) {
+            if (!out) return false;
+            std::string t;
+            for (char c : token) {
+                if (!std::isspace((unsigned char)c)) t.push_back(c);
+            }
+            if (t.empty()) return false;
+            size_t dash = t.find('-');
+            if (dash == std::string::npos) {
+                uint32_t v = 0;
+                if (!TryParseUInt32(t, &v, 10) || v > 65535) return false;
+                out->start = static_cast<uint16_t>(v);
+                out->end = static_cast<uint16_t>(v);
+                return true;
+            }
+            std::string a = t.substr(0, dash);
+            std::string b = t.substr(dash + 1);
+            if (a.empty() || b.empty()) return false;
+            uint32_t va = 0;
+            uint32_t vb = 0;
+            if (!TryParseUInt32(a, &va, 10) || !TryParseUInt32(b, &vb, 10)) return false;
+            if (va > 65535 || vb > 65535) return false;
+            if (va > vb) std::swap(va, vb);
+            out->start = static_cast<uint16_t>(va);
+            out->end = static_cast<uint16_t>(vb);
+            return true;
+        }
+
+        static bool MatchPort(uint16_t port, const std::vector<PortRange>& ranges) {
+            if (ranges.empty()) return true;
+            if (port == 0) return false;
+            for (const auto& r : ranges) {
+                if (port >= r.start && port <= r.end) return true;
+            }
+            return false;
+        }
+
+        static bool MatchProtocol(const char* protocol, const std::vector<std::string>& protocols) {
+            if (protocols.empty()) return true;
+            std::string p = protocol ? ToLower(protocol) : "";
+            for (const auto& proto : protocols) {
+                if (p == proto) return true;
+            }
+            return false;
+        }
+
+        void CompileRoutingRules() {
+            compiled_rules.clear();
+            compiled_order.clear();
+            compiled_valid_cidr_v4 = 0;
+            compiled_valid_cidr_v6 = 0;
+            compiled_valid_port_ranges = 0;
+            compiled_skipped_invalid_items = 0;
+            compiled_skipped_invalid_cidr_v4 = 0;
+            compiled_skipped_invalid_cidr_v6 = 0;
+            compiled_skipped_invalid_ports = 0;
+
+            std::vector<RoutingRule> srcRules = routing.rules;
+            if (routing.use_default_private) {
+                RoutingRule def;
+                def.name = "default-private";
+                def.action = "direct";
+                def.ip_cidrs_v4 = {
+                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                    "127.0.0.0/8", "169.254.0.0/16"
+                };
+                def.ip_cidrs_v6 = {
+                    "fc00::/7", "fe80::/10", "::1/128"
+                };
+                // Issue #169：内网直连同时覆盖 UDP，局域网 UDP（如 WebRTC P2P）不再送入 SOCKS5 relay，
+                // udp_mode=block 时也据此放行（见 Hooks.cpp IsUdpBlockExempt），与 TCP 及配置页“内网直连”语义一致
+                def.protocols = {"tcp", "udp"};
+                srcRules.insert(srcRules.begin(), def);
+            }
+
+            for (const auto& rule : srcRules) {
+                CompiledRoutingRule cr{};
+                cr.raw = rule;
+                cr.raw.action = ToLower(cr.raw.action);
+                cr.raw.name = cr.raw.name.empty() ? "(unnamed)" : cr.raw.name;
+                if (!cr.raw.action.empty() && cr.raw.action != "proxy" && cr.raw.action != "direct") {
+                    Logger::Warn("路由规则: action 无效(" + cr.raw.action + "), rule=" + cr.raw.name);
+                    cr.raw.action = routing.default_action;
+                }
+
+                for (const auto& cidr : rule.ip_cidrs_v4) {
+                    CidrRuleV4 r{};
+                    if (ParseCidrV4(cidr, &r)) {
+                        cr.v4.push_back(r);
+                        compiled_valid_cidr_v4++;
+                    } else {
+                        Logger::Warn("路由规则: IPv4 CIDR 无效(" + cidr + "), rule=" + cr.raw.name);
+                        compiled_skipped_invalid_items++;
+                        compiled_skipped_invalid_cidr_v4++;
+                    }
+                }
+                for (const auto& cidr : rule.ip_cidrs_v6) {
+                    CidrRuleV6 r{};
+                    if (ParseCidrV6(cidr, &r)) {
+                        cr.v6.push_back(r);
+                        compiled_valid_cidr_v6++;
+                    } else {
+                        Logger::Warn("路由规则: IPv6 CIDR 无效(" + cidr + "), rule=" + cr.raw.name);
+                        compiled_skipped_invalid_items++;
+                        compiled_skipped_invalid_cidr_v6++;
+                    }
+                }
+                for (const auto& d : rule.domains) {
+                    std::string norm = ToLower(d);
+                    while (!norm.empty() && norm.back() == '.') norm.pop_back();
+                    if (!norm.empty()) cr.domains.push_back(norm);
+                }
+                for (const auto& p : rule.ports) {
+                    PortRange pr{};
+                    if (ParsePortRange(p, &pr)) {
+                        cr.port_ranges.push_back(pr);
+                        compiled_valid_port_ranges++;
+                    } else {
+                        Logger::Warn("路由规则: 端口范围无效(" + p + "), rule=" + cr.raw.name);
+                        compiled_skipped_invalid_items++;
+                        compiled_skipped_invalid_ports++;
+                    }
+                }
+                for (const auto& proto : rule.protocols) {
+                    std::string norm = ToLower(proto);
+                    if (!norm.empty()) cr.protocols.push_back(norm);
+                }
+
+                compiled_rules.push_back(cr);
+            }
+
+            const bool useNumber = (ToLower(routing.priority_mode) == "number");
+            compiled_order.resize(compiled_rules.size());
+            for (size_t i = 0; i < compiled_order.size(); i++) compiled_order[i] = i;
+            if (useNumber) {
+                std::stable_sort(compiled_order.begin(), compiled_order.end(),
+                    [&](size_t a, size_t b) {
+                        return compiled_rules[a].raw.priority > compiled_rules[b].raw.priority;
+                    });
+            }
+        }
+
+        bool MatchRouting(const std::string& host, const std::string& ip, bool ipIsV6, uint16_t port,
+                          const char* protocol, std::string* outAction, std::string* outRule) const {
+            if (!routing.enabled) return false;
+            std::string action = ToLower(routing.default_action);
+            if (action != "proxy" && action != "direct") {
+                action = "proxy";
+            }
+
+            std::string ipStr = ip;
+            std::string hostStr = host;
+            if (!hostStr.empty() && hostStr.back() == '.') hostStr.pop_back();
+            // 性能优化：域名匹配热路径避免重复 ToLower/分配；统一在此处转为小写
+            if (!hostStr.empty()) hostStr = ToLower(std::move(hostStr));
+
+            const bool hasHost = !hostStr.empty();
+            const bool hasIp = !ipStr.empty();
+
+            std::array<uint8_t, 16> ip6{};
+            uint32_t ip4 = 0;
+            bool ip4Valid = false;
+            bool ip6Valid = false;
+            if (hasIp) {
+                if (ipIsV6) {
+                    ip6Valid = ParseIPv6(ipStr, &ip6);
+                } else {
+                    ip4Valid = ParseIPv4(ipStr, &ip4);
+                }
+            } else if (!hostStr.empty()) {
+                // host 可能是 IP 字面量
+                ip4Valid = ParseIPv4(hostStr, &ip4);
+                ip6Valid = !ip4Valid && ParseIPv6(hostStr, &ip6);
+            }
+
+            for (size_t idx : compiled_order) {
+                const auto& rule = compiled_rules[idx];
+                if (!rule.raw.enabled) continue;
+                if (!MatchProtocol(protocol, rule.protocols)) continue;
+                if (!MatchPort(port, rule.port_ranges)) continue;
+
+                bool matched = rule.domains.empty() && rule.v4.empty() && rule.v6.empty();
+                if (hasHost && !rule.domains.empty()) {
+                    for (const auto& pattern : rule.domains) {
+                        if (MatchDomainPattern(pattern, hostStr)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if (!matched && ip4Valid && !rule.v4.empty()) {
+                    for (const auto& r : rule.v4) {
+                        if (MatchCidrV4(ip4, r)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if (!matched && ip6Valid && !rule.v6.empty()) {
+                    for (const auto& r : rule.v6) {
+                        if (MatchCidrV6(ip6, r)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (matched) {
+                    if (outAction) *outAction = rule.raw.action.empty() ? action : rule.raw.action;
+                    if (outRule) *outRule = rule.raw.name;
+                    return true;
+                }
+            }
+
+            if (outAction) *outAction = action;
+            if (outRule) *outRule = "";
+            return false;
+        }
+    };
+
+
+    struct LoggingConfig { bool enabled = true; std::string level = "info"; };
+    struct TrafficMonitorConfig { bool enabled = false; };
+
+    class Config {
+        static std::string Normalize(std::string s) {
+            return ProxyRules::ToLower(std::string(ProxyRules::TrimView(s)));
+        }
+        static void Require(bool condition, const char* message) {
+            if (!condition) throw std::invalid_argument(message);
+        }
+        static void Enum(std::string& s, std::initializer_list<const char*> choices) {
+            s = Normalize(s);
+            for (auto choice : choices) if (s == choice) return;
+            throw std::invalid_argument("Invalid configuration enum");
+        }
+        static std::string BaseName(std::string s) {
+            auto slash = s.find_last_of("\\/");
+            if (slash != std::string::npos) s.erase(0, slash + 1);
+            return Normalize(s);
+        }
+    public:
+        ProxyConfig proxy;
+        FakeIPConfig fakeIp;
+        TimeoutConfig timeout;
+        ProxyRules rules;
+        LoggingConfig logging;
+        TrafficMonitorConfig trafficMonitor;
+        bool trafficLogging = false;
+        bool childInjection = true;
+        bool desktopHostNetworkHooks = true;
+        // Retained as a compatibility field; broad inherit is intentionally forbidden.
+        std::string childInjectionMode = "filtered";
+        std::vector<std::string> childInjectionExclude;
+        std::vector<std::string> targetProcesses = {
+            "codex.exe", "chatgpt.exe", "codex-code-mode-host.exe",
+            "codex-computer-use-swift.exe", "extension-host.exe"
+        };
+        std::filesystem::path loadedPath;
+
+        bool ShouldInject(const std::string& name) const {
+            auto base = BaseName(name);
+            for (const auto& target : targetProcesses) {
+                auto expected = Normalize(target);
+                // Exact basename only; no substrings, wildcards, or empty-list=all.
+                if (!expected.empty() && base == expected) return true;
+            }
+            return false;
+        }
+        bool IsChildInjectionExcluded(const std::string& name) const {
+            auto base = BaseName(name);
+            for (const auto& item : childInjectionExclude) if (base == Normalize(item)) return true;
+            return false;
+        }
+        bool ShouldInjectChildProcess(const std::string& name) const {
+            return childInjection && ShouldInject(name) && !IsChildInjectionExcluded(name);
+        }
+        static Config& Instance() { static Config config; return config; }
+
+        // Transactional parser: failure leaves the previous configuration intact.
+        bool Parse(const nlohmann::json& j, std::string* error = nullptr) {
+            try {
+                Require(j.is_object(), "Configuration must be an object");
+                Config c;
+                c.desktopHostNetworkHooks = j.value("desktop_host_network_hooks", true);
+                if (j.contains("proxy")) {
+                    const auto& p = j.at("proxy");
+                    c.proxy.host = p.value("host", c.proxy.host);
+                    c.proxy.port = p.value("port", c.proxy.port);
+                    c.proxy.type = p.value("type", c.proxy.type);
+                    c.proxy.username = p.value("username", std::string());
+                    c.proxy.password = p.value("password", std::string());
+                    c.proxy.ignore_system_proxy = p.value("ignore_system_proxy", true);
+                }
+                c.proxy.host = std::string(ProxyRules::TrimView(c.proxy.host));
+                Require(!c.proxy.host.empty() && c.proxy.host.find_first_of("\r\n\0",0,3) == std::string::npos,
+                        "Invalid proxy host");
+                Require(c.proxy.port >= 0 && c.proxy.port <= 65535, "Invalid proxy port");
+                Enum(c.proxy.type, {"socks5", "http"});
+                if (j.contains("fake_ip")) {
+                    const auto& p = j.at("fake_ip");
+                    c.fakeIp.enabled = p.value("enabled", true);
+                    c.fakeIp.cidr = p.value("cidr", c.fakeIp.cidr);
+                }
+                ProxyRules::CidrRuleV4 pool{};
+                Require(ProxyRules::ParseCidrV4(c.fakeIp.cidr, &pool) &&
+                        pool.mask >= 0xfffe0000u && pool.mask <= 0xfffffffcu,
+                        "FakeIP requires an IPv4 /15 through /30 pool");
+                if (j.contains("timeout")) {
+                    const auto& p = j.at("timeout");
+                    c.timeout.connect_ms = p.value("connect_ms", p.value("connect", 5000));
+                    c.timeout.send_ms = p.value("send_ms", p.value("send", 5000));
+                    c.timeout.recv_ms = p.value("recv_ms", p.value("recv", 5000));
+                }
+                for (int ms : {c.timeout.connect_ms, c.timeout.send_ms, c.timeout.recv_ms})
+                    Require(ms > 0 && ms <= 300000, "Timeout must be 1..300000 ms");
+                // rules is canonical; proxy_rules is accepted for migration.
+                const auto& pr = j.contains("rules") ? j.at("rules") :
+                    (j.contains("proxy_rules") ? j.at("proxy_rules") : nlohmann::json::object());
+                Require(pr.is_object(), "rules must be an object");
+                if (pr.contains("allowed_ports")) {
+                    Require(pr.at("allowed_ports").is_array(), "allowed_ports must be an array");
+                    c.rules.allowed_ports.clear();
+                    for (const auto& p : pr.at("allowed_ports")) {
+                        Require(p.is_number_integer(), "Port must be an integer");
+                        auto port = p.get<int64_t>();
+                        Require(port > 0 && port <= 65535, "Invalid allowed port");
+                        c.rules.allowed_ports.push_back(static_cast<uint16_t>(port));
+                    }
+                }
+                std::sort(c.rules.allowed_ports.begin(), c.rules.allowed_ports.end());
+                c.rules.allowed_ports.erase(std::unique(c.rules.allowed_ports.begin(), c.rules.allowed_ports.end()), c.rules.allowed_ports.end());
+                c.rules.dns_mode = pr.value("dns_mode", c.rules.dns_mode);
+                c.rules.ipv6_mode = pr.value("ipv6_mode", c.rules.ipv6_mode);
+                c.rules.udp_mode = pr.value("udp_mode", c.rules.udp_mode);
+                c.rules.udp_fallback = pr.value("udp_fallback", c.rules.udp_fallback);
+                Enum(c.rules.dns_mode, {"direct", "proxy"});
+                Enum(c.rules.ipv6_mode, {"direct", "proxy", "block"});
+                Enum(c.rules.udp_mode, {"auto", "direct", "proxy", "block"});
+                Enum(c.rules.udp_fallback, {"direct", "block"});
+                if (pr.contains("routing")) {
+                    const auto& rt = pr.at("routing");
+                    c.rules.routing.enabled = rt.value("enabled", true);
+                    c.rules.routing.priority_mode = rt.value("priority_mode", "order");
+                    c.rules.routing.default_action = rt.value("default_action", "proxy");
+                    c.rules.routing.use_default_private = rt.value("use_default_private", true);
+                    Enum(c.rules.routing.priority_mode, {"order", "number"});
+                    Enum(c.rules.routing.default_action, {"proxy", "direct"});
+                    if (rt.contains("rules")) {
+                        Require(rt.at("rules").is_array(), "routing.rules must be an array");
+                        for (const auto& item : rt.at("rules")) {
+                            RoutingRule rule;
+                            rule.name = item.value("name", "");
+                            rule.enabled = item.value("enabled", true);
+                            rule.action = item.value("action", "proxy");
+                            rule.priority = item.value("priority", 0);
+                            Enum(rule.action, {"direct", "proxy"});
+                            rule.ip_cidrs_v4 = item.value("ip_cidrs_v4", std::vector<std::string>{});
+                            rule.ip_cidrs_v6 = item.value("ip_cidrs_v6", std::vector<std::string>{});
+                            rule.domains = item.value("domains", std::vector<std::string>{});
+                            if (item.contains("ports")) {
+                                for (const auto& port : item.at("ports")) {
+                                    Require(port.is_string() || port.is_number_integer(), "Invalid routing port");
+                                    rule.ports.push_back(port.is_string() ? port.get<std::string>() : port.dump());
+                                }
+                            }
+                            rule.protocols = item.value("protocols", std::vector<std::string>{});
+                            for (auto& proto : rule.protocols) Enum(proto, {"tcp", "udp"});
+                            for (auto& domain : rule.domains) {
+                                domain = Normalize(domain);
+                                Require(!domain.empty(), "Empty routing domain");
+                            }
+                            c.rules.routing.rules.push_back(std::move(rule));
+                        }
+                    }
+                }
+                c.rules.CompileRoutingRules();
+                Require(c.rules.compiled_skipped_invalid_items == 0, "Invalid CIDR or routing port");
+                if (j.contains("target_processes"))
+                    c.targetProcesses = j.at("target_processes").get<std::vector<std::string>>();
+                for (auto& name : c.targetProcesses) {
+                    name = Normalize(name);
+                    Require(!name.empty() && name.find_first_of("\\/*?") == std::string::npos,
+                            "target_processes requires exact executable basenames");
+                }
+                if (j.contains("child_injection") && j.at("child_injection").is_object()) {
+                    const auto& p = j.at("child_injection");
+                    c.childInjection = p.value("enabled", true);
+                    c.childInjectionExclude = p.value("exclude", std::vector<std::string>{});
+                } else c.childInjection = j.value("child_injection", true);
+                if (j.contains("child_injection_exclude"))
+                    c.childInjectionExclude = j.at("child_injection_exclude").get<std::vector<std::string>>();
+                Require(j.value("child_injection_mode", "filtered") == "filtered", "Only filtered child injection is supported");
+                if (j.contains("logging")) {
+                    c.logging.enabled = j.at("logging").value("enabled", true);
+                    c.logging.level = j.at("logging").value("level", "info");
+                } else c.logging.level = j.value("log_level", "info");
+                Enum(c.logging.level, {"debug", "info", "warn", "error"});
+                if (j.contains("traffic_monitor"))
+                    c.trafficMonitor.enabled = j.at("traffic_monitor").value("enabled", false);
+                else c.trafficMonitor.enabled = j.value("traffic_logging", false);
+                c.trafficLogging = c.trafficMonitor.enabled;
+                *this = std::move(c);
+                if (error) error->clear();
+                return true;
+            } catch (...) {
+                // Do not echo JSON exceptions: they may contain proxy credentials.
+                if (error) *error = "Invalid configuration; check field types, ranges and enums";
+                return false;
+            }
+        }
+        static std::filesystem::path FindConfig(
+            const std::filesystem::path& dllDir = ModuleDirectory(),
+            const std::filesystem::path& localDir = Environment(L"LOCALAPPDATA")) {
+            std::vector<std::filesystem::path> paths;
+            auto overridePath = Environment(L"CODEX_PROXY_CONFIG");
+            if (!overridePath.empty()) paths.emplace_back(overridePath);
+            paths.push_back(dllDir / L"config.json");
+            // Installer-owned UTF-8 pointer lets CLI shims find a custom
+            // installation without copying credentials into the CLI directory.
+            std::ifstream locator(dllDir / L"codex-proxy.config-path", std::ios::binary);
+            std::string value;
+            if (locator && std::getline(locator, value) && value.size() <= 131072) {
+                if (value.compare(0, 3, "\xef\xbb\xbf") == 0) value.erase(0, 3);
+                if (!value.empty() && value.back() == '\r') value.pop_back();
+                if (!value.empty() && value.find('\0') == std::string::npos) {
+                    try {
+                        auto located = std::filesystem::u8path(value);
+                        if (located.is_absolute()) paths.push_back(std::move(located));
+                    } catch (const std::exception&) { /* Invalid locator: use the normal fallback. */ }
+                }
+            }
+            if (!localDir.empty()) paths.push_back(localDir / L"codex-proxy" / L"config.json");
+            for (const auto& path : paths) {
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(path, ec)) return path;
+            }
+            return {};
+        }
+        bool Load(const std::filesystem::path& path = {}) {
+            try {
+                auto chosen = path.empty() ? FindConfig() : path;
+                if (chosen.empty()) return false;
+                std::ifstream file(chosen, std::ios::binary);
+                if (!file) return false;
+                auto json = nlohmann::json::parse(file);
+                if (!Parse(json)) { Logger::Error("Invalid configuration; hooks disabled"); return false; }
+                loadedPath = std::filesystem::absolute(chosen);
+                Logger::SetEnabled(logging.enabled);
+                Logger::SetLevelFromString(logging.level);
+                Logger::Info("Configuration loaded: " + loadedPath.u8string());
+                return true;
+            } catch (...) { Logger::Error("Configuration could not be loaded; hooks disabled"); return false; }
+        }
+    };
+}

@@ -1,0 +1,4 @@
+antigravity-proxy
+https://github.com/yuaotian/antigravity-proxy
+Reference revision: ae910aa37beb85681ed8c485137c965b05cf25b1
+License: BSD-2-Clause; see LICENSE.txt and AUTHORS.txt

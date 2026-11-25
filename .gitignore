@@ -1,0 +1,8 @@
+/build*/
+/.deps/
+/logs/
+*.user
+*.pdb
+/config.json
+/output/
+/tests/tmp*/

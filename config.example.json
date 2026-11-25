@@ -1,0 +1,55 @@
+{
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 7890,
+    "type": "socks5",
+    "username": "",
+    "password": "",
+    "ignore_system_proxy": true
+  },
+  "fake_ip": {
+    "enabled": true,
+    "cidr": "198.18.0.0/15"
+  },
+  "timeout": {
+    "connect_ms": 5000,
+    "send_ms": 5000,
+    "recv_ms": 5000
+  },
+  "rules": {
+    "allowed_ports": [
+      80,
+      443
+    ],
+    "dns_mode": "direct",
+    "ipv6_mode": "proxy",
+    "udp_mode": "auto",
+    "udp_fallback": "block",
+    "routing": {
+      "enabled": true,
+      "priority_mode": "order",
+      "default_action": "proxy",
+      "use_default_private": true,
+      "rules": []
+    }
+  },
+  "target_processes": [
+    "codex.exe",
+    "chatgpt.exe",
+    "codex-code-mode-host.exe",
+    "codex-computer-use-swift.exe",
+    "extension-host.exe"
+  ],
+  "child_injection": {
+    "enabled": true,
+    "exclude": []
+  },
+  "logging": {
+    "enabled": true,
+    "level": "info"
+  },
+  "traffic_monitor": {
+    "enabled": false
+  },
+  "desktop_host_network_hooks": true
+}
