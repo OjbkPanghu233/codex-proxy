@@ -85,6 +85,7 @@ decltype(&WinHttpGetIEProxyConfigForCurrentUser) fpWinHttpIEProxy = nullptr;
 decltype(&WinHttpGetProxyForUrl) fpWinHttpProxyForUrl = nullptr;
 decltype(&ioctlsocket) fpIoctlSocket=nullptr;
 decltype(&WSAEventSelect) fpWSAEventSelect=nullptr;
+decltype(&WSAEnumNetworkEvents) fpWSAEnumNetworkEvents=nullptr;
 decltype(&WSAAsyncSelect) fpWSAAsyncSelect=nullptr;
 connect_t fpConnect = NULL;
 socket_t fpSocket = NULL;
@@ -295,8 +296,14 @@ static std::string GetUdpPolicyLabel(const Core::Config& config) {
 }
 
 
+struct EventSelectState {
+    WSAEVENT event = nullptr;
+    long events = 0;
+    bool pendingConnect = false;
+};
 static std::mutex g_socketModesMutex;
 static std::unordered_map<SOCKET,bool> g_socketNonblocking;
+static std::unordered_map<SOCKET,EventSelectState> g_socketEventSelect;
 static void RememberSocketMode(SOCKET s,bool nonblocking) {
     if(s==INVALID_SOCKET) return;
     std::lock_guard<std::mutex> lock(g_socketModesMutex);
@@ -309,8 +316,50 @@ int WSAAPI DetourIoctlSocket(SOCKET s,long command,u_long* argument) {
 }
 int WSAAPI DetourWSAEventSelect(SOCKET s,WSAEVENT event,long events) {
     int result=fpWSAEventSelect(s,event,events);
-    if(result==0 && events) RememberSocketMode(s,true);
+    if(result==0) {
+        std::lock_guard<std::mutex> lock(g_socketModesMutex);
+        if(events) {
+            g_socketNonblocking[s]=true;
+            g_socketEventSelect[s]=EventSelectState{event,events,false};
+        } else {
+            g_socketEventSelect.erase(s);
+        }
+    }
     return result;
+}
+int WSAAPI DetourWSAEnumNetworkEvents(SOCKET s,WSAEVENT hEventObject,LPWSANETWORKEVENTS lpNetworkEvents) {
+    int result=fpWSAEnumNetworkEvents(s,hEventObject,lpNetworkEvents);
+    if(result==0 && lpNetworkEvents) {
+        bool consumeConnect=false;
+        {
+            std::lock_guard<std::mutex> lock(g_socketModesMutex);
+            auto it=g_socketEventSelect.find(s);
+            if(it!=g_socketEventSelect.end() && it->second.pendingConnect) {
+                it->second.pendingConnect=false;
+                consumeConnect=true;
+            }
+        }
+        if(consumeConnect) {
+            lpNetworkEvents->lNetworkEvents|=FD_CONNECT;
+            lpNetworkEvents->iErrorCode[FD_CONNECT_BIT]=0;
+        }
+    }
+    return result;
+}
+static bool TryDeferNonblockingConnect(SOCKET s) {
+    WSAEVENT eventToSignal=nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_socketModesMutex);
+        auto it=g_socketEventSelect.find(s);
+        if(it==g_socketEventSelect.end() || !it->second.event || (it->second.events & FD_CONNECT)==0) {
+            return false;
+        }
+        it->second.pendingConnect=true;
+        eventToSignal=it->second.event;
+    }
+    WSASetEvent(eventToSignal);
+    WSASetLastError(WSAEWOULDBLOCK);
+    return true;
 }
 int WSAAPI DetourWSAAsyncSelect(SOCKET s,HWND window,u_int message,long events) {
     int result=fpWSAAsyncSelect(s,window,message,events);
@@ -730,6 +779,27 @@ static bool ShouldLogUdpProxyFail() {
 // loopback、UDP/53，以及命中 direct 路由规则的目标（含 use_default_private 内置的局域网/保留网段）。
 // 意图：block 只阻止 UDP 走公网，局域网 P2P（如 WebRTC host 候选）应与 TCP 一样直连。
 // 仅“命中规则且动作为 direct”才放行；未命中时的 default_action 不参与，避免 default_action=direct 让 block 失效。
+static bool IsChromiumNetworkServiceProcess() {
+    static const bool s_isNetworkService = []() {
+        const wchar_t* cmd = GetCommandLineW();
+        return cmd != nullptr && std::wcsstr(cmd, L"--utility-sub-type=network.mojom.NetworkService") != nullptr;
+    }();
+    return s_isNetworkService;
+}
+
+// Chromium NetworkService 内置 AsyncDns 会绕过 GetAddrInfoW 直接发 UDP/TCP 53，
+// 在 FakeIP 开启且 dns_mode!=proxy 时容易被本地 ISP/GFW DNS 污染为错误 IPv6。
+// 阻断内置客户端的原生 53 端口查询可迫使 Chromium 立刻回退到系统 GetAddrInfoW -> FakeIP -> 代理远端解析。
+static bool ShouldBlockRawDnsInNetworkService(const Core::Config& config, const sockaddr* dst) {
+    if (!dst || !IsChromiumNetworkServiceProcess()) return false;
+    if (!config.fakeIp.enabled || config.proxy.port == 0) return false;
+    if (config.rules.dns_mode == "proxy") return false;
+    uint16_t port = 0;
+    if (!TryGetSockaddrPort(dst, &port) || port != 53) return false;
+    if (IsSockaddrLoopback(dst)) return false;
+    return true;
+}
+
 static bool IsUdpBlockExempt(const Core::Config& config, const sockaddr* dst, bool hasPort, uint16_t dstPort) {
     if (!dst) return false;
     if (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53 && config.rules.dns_mode == "direct")) return true;
@@ -2215,6 +2285,10 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
         if (soType != SOCK_STREAM) {
 
             if (soType == SOCK_DGRAM) {
+                if (ShouldBlockRawDnsInNetworkService(config, name)) {
+                    WSASetLastError(WSAECONNREFUSED);
+                    return SOCKET_ERROR;
+                }
                 // 有效策略为 block 时阻断 UDP（DNS/loopback 例外），促使应用回退到 TCP。
                 if (IsBlockedUdpV6(name)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; }
             const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
@@ -2374,6 +2448,10 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
     // ============= 智能路由决策 =============
     // ROUTE-1: DNS 端口特殊处理 (解决 DNS 超时问题)
     if (originalPort == 53) {
+        if (ShouldBlockRawDnsInNetworkService(config, name)) {
+            WSASetLastError(WSAECONNREFUSED);
+            return SOCKET_ERROR;
+        }
         if (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty()) {
             if (ShouldLogRouteDecisionInfo()) {
                 Core::Logger::Info("DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
@@ -2461,6 +2539,9 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
             return SOCKET_ERROR;
         }
         
+        if (TryDeferNonblockingConnect(s)) {
+            return SOCKET_ERROR;
+        }
         return 0; // 成功
     }
     
@@ -2584,7 +2665,7 @@ int WSAAPI DetourCloseSocket(SOCKET s) {
     if (IsLocalBypassSocket(s)) {
         const int result = fpCloseSocket(s);
         const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
-        if (result == 0) { SetLocalBypassSocket(s, false); std::lock_guard<std::mutex> lock(g_socketModesMutex); g_socketNonblocking.erase(s); }
+        if (result == 0) { SetLocalBypassSocket(s, false); std::lock_guard<std::mutex> lock(g_socketModesMutex); g_socketNonblocking.erase(s); g_socketEventSelect.erase(s); }
         if (result == SOCKET_ERROR) WSASetLastError(error);
         return result;
     }
@@ -2623,7 +2704,7 @@ int WSAAPI DetourCloseSocket(SOCKET s) {
         }
     }
     CleanupUdpProxyContext(s);
-    { std::lock_guard<std::mutex> lock(g_socketModesMutex); g_socketNonblocking.erase(s); }
+    { std::lock_guard<std::mutex> lock(g_socketModesMutex); g_socketNonblocking.erase(s); g_socketEventSelect.erase(s); }
 
     // 关闭成功后清理映射，避免句柄复用导致的误关联
     ForgetSocketTarget(s);
@@ -2959,7 +3040,11 @@ BOOL PASCAL DetourConnectEx(
         WSASetLastError(WSAEFAULT);
         return FALSE;
     }
-    if (namelen < (int)sizeof(sockaddr)) {
+    if (namelen < (int)sizeof(name->sa_family)) {
+        WSASetLastError(WSAEINVAL);
+        return FALSE;
+    }
+    if (name->sa_family != AF_UNIX && namelen < (int)sizeof(sockaddr)) {
         WSASetLastError(WSAEINVAL);
         return FALSE;
     }
@@ -3159,6 +3244,10 @@ BOOL PASCAL DetourConnectEx(
     // ============= 智能路由决策（与 PerformProxyConnect 保持一致） =============
     // ROUTE-1: DNS 端口特殊处理 (解决 DNS 超时问题)
     if (originalPort == 53) {
+        if (ShouldBlockRawDnsInNetworkService(config, name)) {
+            WSASetLastError(WSAECONNREFUSED);
+            return FALSE;
+        }
         if (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty()) {
             if (ShouldLogRouteDecisionInfo()) {
                 Core::Logger::Info("ConnectEx DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
@@ -3968,6 +4057,10 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
                 }
             }
 
+            if (ShouldBlockRawDnsInNetworkService(config, dst)) {
+                WSASetLastError(WSAECONNREFUSED);
+                return SOCKET_ERROR;
+            }
             if (IsBlockedUdpV6(dst)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; }
             const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
             if (udpAction == Core::UdpAction::Block) {
@@ -4103,6 +4196,10 @@ int WSAAPI DetourWSASendTo(
                 }
             }
 
+            if (ShouldBlockRawDnsInNetworkService(config, dst)) {
+                WSASetLastError(WSAECONNREFUSED);
+                return SOCKET_ERROR;
+            }
             if (IsBlockedUdpV6(dst)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; }
             const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
             if (udpAction == Core::UdpAction::Block) {
@@ -4275,6 +4372,7 @@ namespace Hooks {
         if (network) {
             CP_HOOK(L"ws2_32.dll", "ioctlsocket", DetourIoctlSocket, fpIoctlSocket);
             CP_HOOK(L"ws2_32.dll", "WSAEventSelect", DetourWSAEventSelect, fpWSAEventSelect);
+            CP_HOOK(L"ws2_32.dll", "WSAEnumNetworkEvents", DetourWSAEnumNetworkEvents, fpWSAEnumNetworkEvents);
             CP_HOOK(L"ws2_32.dll", "WSAAsyncSelect", DetourWSAAsyncSelect, fpWSAAsyncSelect);
             CP_HOOK(L"ws2_32.dll", "socket", DetourSocket, fpSocket);
             CP_HOOK(L"ws2_32.dll", "WSASocketA", DetourWSASocketA, fpWSASocketA);

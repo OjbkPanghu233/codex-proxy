@@ -130,8 +130,11 @@ inline ProcessRole ClassifyProcess(const std::string& name, const std::string& c
     if (IsCodexEngineProcessName(name) && !codexDesktop) return ProcessRole::Engine;
     if (!IsCodexHostProcessName(name) && !codexDesktop) return ProcessRole::NotTarget;
     if (type.empty()) return ProcessRole::DesktopMain;
-    if (type == "utility" && SwitchValue(args, "--utility-sub-type") == "network.mojom.NetworkService")
-        return ProcessRole::NetworkService;
+    if (type == "utility") {
+        auto sub = SwitchValue(args, "--utility-sub-type");
+        if (sub == "network.mojom.NetworkService" || sub == "node.mojom.NodeService")
+            return ProcessRole::NetworkService;
+    }
     return ProcessRole::ChromiumOther;
 }
 inline bool EnableNetworkHooks(ProcessRole role, bool desktopHostNetworkHooks = true) {

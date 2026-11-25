@@ -73,19 +73,39 @@ void SyncWritable(const std::filesystem::path& target,const std::filesystem::pat
         if(!CopyFileW(source.c_str(),destination.c_str(),FALSE))throw std::runtime_error("Cannot synchronize desktop DLL/config; close the app and retry");
     }
 }
+bool MatchesDesktopImage(const Process& process,const std::vector<std::filesystem::path>& candidates,bool packageScope) {
+    for(auto& target:candidates)if(Launcher::File(target)&&Core::SameImage(target,process.image))return true;
+    auto name=Launcher::Lower(process.image.filename().wstring());auto path=Launcher::Lower(process.image.wstring());
+    return packageScope&&(name==L"chatgpt.exe"||name==L"codex.exe")&&path.find(L"\\windowsapps\\openai.codex_")!=std::wstring::npos&&process.image.parent_path().filename()==L"app";
+}
+bool IsPackageScope(const std::vector<std::filesystem::path>& candidates) {
+    return std::any_of(candidates.begin(),candidates.end(),[](const std::filesystem::path& p){auto path=Launcher::Lower(p.wstring());return Launcher::Lower(p.filename().wstring())==L"chatgpt-desktop.exe"||path.find(L"\\windowsapps\\openai.codex_")!=std::wstring::npos;});
+}
 std::vector<Process> Roots(const std::vector<Process>& all,const std::vector<std::filesystem::path>& candidates) {
     std::vector<Process> matches,result;
-    bool packageScope=std::any_of(candidates.begin(),candidates.end(),[](const std::filesystem::path& p){auto path=Launcher::Lower(p.wstring());return Launcher::Lower(p.filename().wstring())==L"chatgpt-desktop.exe"||path.find(L"\\windowsapps\\openai.codex_")!=std::wstring::npos;});
+    bool packageScope=IsPackageScope(candidates);
     for(auto& process:all) {
-        bool match=false;for(auto& target:candidates)if(Launcher::File(target)&&Core::SameImage(target,process.image)){match=true;break;}
-        auto name=Launcher::Lower(process.image.filename().wstring());auto path=Launcher::Lower(process.image.wstring());
-        if(packageScope&&(name==L"chatgpt.exe"||name==L"codex.exe")&&path.find(L"\\windowsapps\\openai.codex_")!=std::wstring::npos&&process.image.parent_path().filename()==L"app")match=true;
-        if(match)matches.push_back(process);
+        if(!MatchesDesktopImage(process,candidates,packageScope))continue;
+        auto role=Hooks::ClassifyProcess(process.image.filename().u8string(),Launcher::Utf8(process.command));
+        if(role==Hooks::ProcessRole::NetworkService||role==Hooks::ProcessRole::ChromiumOther)continue;
+        matches.push_back(process);
     }
     for(auto& process:matches) {
         if(std::none_of(matches.begin(),matches.end(),[&](const Process& parent){return parent.pid==process.parent;}))result.push_back(process);
     }
     return result;
+}
+void CleanupOrphanChildren(const std::vector<Process>& all,const std::vector<std::filesystem::path>& candidates) {
+    bool packageScope=IsPackageScope(candidates);
+    std::set<DWORD> alive;for(auto& p:all)alive.insert(p.pid);
+    for(auto& process:all) {
+        if(!MatchesDesktopImage(process,candidates,packageScope))continue;
+        auto role=Hooks::ClassifyProcess(process.image.filename().u8string(),Launcher::Utf8(process.command));
+        if(role!=Hooks::ProcessRole::NetworkService&&role!=Hooks::ProcessRole::ChromiumOther)continue;
+        if(alive.count(process.parent))continue;
+        Launcher::Handle handle(OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE,FALSE,process.pid));
+        if(handle.value){TerminateProcess(handle,0);WaitForSingleObject(handle,3000);}
+    }
 }
 std::vector<Process> Tree(const std::vector<Process>& all,const std::vector<Process>& roots) {
     std::set<DWORD> ids;for(auto& p:roots)ids.insert(p.pid);
@@ -144,13 +164,17 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
         if(action==Launcher::DesktopAction::MissingRunning)throw std::runtime_error("No running Codex desktop to attach");
         if(action==Launcher::DesktopAction::Attach)Attach(all,roots,config);
         if(action==Launcher::DesktopAction::Restart)Restart(all,roots);
+        if(roots.empty()&&action==Launcher::DesktopAction::Launch)CleanupOrphanChildren(all,target.empty()?candidates:std::vector<std::filesystem::path>{target});
         if(action==Launcher::DesktopAction::Wake||action==Launcher::DesktopAction::Attach) {
             for(auto& p:roots)EnumWindows(WakeWindow,static_cast<LPARAM>(p.pid));
             if(options.arguments.empty())return 0;
         }
         if(options.syncLocal && action!=Launcher::DesktopAction::Wake&&action!=Launcher::DesktopAction::Attach)SyncWritable(target,config);
         PROCESS_INFORMATION process{};std::string error;
-        if(!Launcher::Spawn(target,options.arguments,config,nullptr,false,true,process,error)) {
+        std::filesystem::path argv0Override;
+        if(Launcher::Lower(target.filename().wstring())==L"chatgpt-desktop.exe")
+            for(auto& pkgExe:packages)if(Launcher::File(pkgExe)&&Launcher::Lower(pkgExe.filename().wstring())==L"chatgpt.exe"){argv0Override=pkgExe;break;}
+        if(!Launcher::Spawn(target,options.arguments,config,nullptr,false,true,process,error,argv0Override)) {
             bool started=false;
             if(Launcher::Lower(target.filename().wstring())==L"chatgpt-desktop.exe")
                 for(auto& fallback:packages)if(Launcher::File(fallback)&&!Core::SameImage(fallback,target))if(Launcher::Spawn(fallback,options.arguments,config,nullptr,false,true,process,error)){started=true;break;}

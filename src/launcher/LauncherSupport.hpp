@@ -129,10 +129,11 @@ inline std::vector<wchar_t> ChildEnvironment(const std::filesystem::path& config
 }
 inline HANDLE Standard(DWORD id){HANDLE value=GetStdHandle(id);if(value==INVALID_HANDLE_VALUE)return nullptr;if(value)SetHandleInformation(value,HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT);return value;}
 inline bool Spawn(const std::filesystem::path& target,const std::vector<std::wstring>& arguments,
-    const std::filesystem::path& config,HANDLE job,bool console,bool force,PROCESS_INFORMATION& process,std::string& error) {
+    const std::filesystem::path& config,HANDLE job,bool console,bool force,PROCESS_INFORMATION& process,std::string& error,
+    const std::filesystem::path& argv0Override={}) {
     auto dll=Core::ModuleDirectory()/L"codex_proxy.dll";
     if(!File(dll)){error="codex_proxy.dll is missing beside launcher";return false;}
-    auto command=Command(target,arguments);auto env=ChildEnvironment(config);
+    auto command=Command(argv0Override.empty()?target:argv0Override,arguments);auto env=ChildEnvironment(config);
     STARTUPINFOW startup{};startup.cb=sizeof(startup);
     if(console){startup.dwFlags=STARTF_USESTDHANDLES;startup.hStdInput=Standard(STD_INPUT_HANDLE);startup.hStdOutput=Standard(STD_OUTPUT_HANDLE);startup.hStdError=Standard(STD_ERROR_HANDLE);}
     if(!CreateProcessW(target.c_str(),command.data(),nullptr,nullptr,console?TRUE:FALSE,
